@@ -96,6 +96,10 @@ def _parse_payload(pt: bytes) -> dict | None:
     return None
 
 
+class ScaleDisconnectedError(ConnectionError):
+    """Raised by S400Scale.events() when the BLE link to the scale is lost."""
+
+
 class S400Scale:
     """Single-scale client.
 
@@ -130,6 +134,7 @@ class S400Scale:
         self._hub = make_notify_hub()
         self._event_queue: asyncio.Queue[ScaleEvent] = asyncio.Queue()
         self._stop = asyncio.Event()
+        self._disconnected = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
 
     async def _credentials(self, *, force_refresh: bool = False) -> tuple[bytes, bytes]:
@@ -141,6 +146,11 @@ class S400Scale:
             self._token = creds.token
         assert self._bindkey is not None and self._token is not None
         return self._bindkey, self._token
+
+    def _on_disconnect(self, _client: BleakClient) -> None:
+        if not self._stop.is_set():
+            logger.warning("BLE link to %s lost", self.mac)
+        self._disconnected.set()
 
     async def _connect(self) -> BleakClient:
         # On macOS the BLE address is an opaque UUID, not the real MAC.
@@ -158,7 +168,8 @@ class S400Scale:
         if not dev:
             raise RuntimeError(f"scale {self.mac} not found in BLE range")
 
-        client = BleakClient(dev, timeout=self.connect_timeout)
+        client = BleakClient(dev, timeout=self.connect_timeout,
+                             disconnected_callback=self._on_disconnect)
         await client.connect()
         return client
 
@@ -266,11 +277,23 @@ class S400Scale:
                 logger.debug("disconnect error: %s", exc)
 
     async def events(self) -> AsyncIterator[ScaleEvent]:
-        """Async iterator over scale events until stopped."""
+        """Async iterator over scale events until stopped.
+
+        Raises ScaleDisconnectedError if the BLE link drops or the reader
+        task dies, instead of waiting forever on a dead connection.
+        """
         while not self._stop.is_set():
             try:
                 ev = await asyncio.wait_for(self._event_queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
+                if self._stop.is_set():
+                    break
+                if self._disconnected.is_set():
+                    raise ScaleDisconnectedError(f"BLE link to {self.mac} lost")
+                for t in self._tasks:
+                    if t.done() and not t.cancelled():
+                        raise ScaleDisconnectedError(
+                            f"reader task for {self.mac} stopped: {t.exception()!r}")
                 continue
             yield ev
 
